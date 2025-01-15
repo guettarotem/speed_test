@@ -3,13 +3,19 @@ import struct
 import sys
 import threading
 import time
-
 from network_config import *
+
 lock_print = threading.Lock()
 
+# ANSI color codes
+class Colors:
+    RESET = "\033[0m"
+    GREEN = "\033[32m"
+    RED = "\033[31m"
+    BLUE = "\033[34m"
+    YELLOW = "\033[33m"
 
 class Client:
-
     def __init__(self):
         self.serverIp = None
         self.sudp_port = None
@@ -20,9 +26,9 @@ class Client:
         self.is_active = True
         self.bordacst = BROADCAST_PORT
 
-    def thread_safe_print(self, message):
+    def thread_safe_print(self, message, color=Colors.RESET):
         with lock_print:
-            print(message)
+            print(f"{color}{message}{Colors.RESET}")
 
     def transfer_udp(self, thread_id):
         try:
@@ -59,11 +65,12 @@ class Client:
                 self.thread_safe_print(
                     f"UDP transfer #{thread_id} finished, total time: {total_time:.2f} seconds, "
                     f"total speed: {speed:.1f} bits/second, "
-                    f"percentage of packets received successfully: {success_rate:.1f}%"
+                    f"percentage of packets received successfully: {success_rate:.1f}%",
+                    color=Colors.GREEN
                 )
 
         except (ConnectionResetError, socket.error) as e:
-            self.thread_safe_print(f"Error during UDP test #{thread_id}: {e}")
+            self.thread_safe_print(f"Error during UDP test #{thread_id}: {e}", color=Colors.RED)
 
     def transfer_tcp(self, thread_id):
         try:
@@ -99,15 +106,16 @@ class Client:
 
                 self.thread_safe_print(
                     f"TCP transfer #{thread_id} finished, total time: {total_time:.2f} seconds, "
-                    f"total speed: {speed:.1f} bits/second"
+                    f"total speed: {speed:.1f} bits/second",
+                    color=Colors.GREEN
                 )
 
         except (ConnectionRefusedError, socket.error) as e:
-            self.thread_safe_print(f"TCP Connection {thread_id} failed: {str(e)}")
+            self.thread_safe_print(f"TCP Connection {thread_id} failed: {str(e)}", color=Colors.RED)
 
     def handle_offer(self):
         threads = []
-        print("Starting transfer tests...")
+        self.thread_safe_print("Starting transfer tests...", color=Colors.BLUE)
 
         # Start UDP transfers
         for i in range(1, self.udp_connections + 1):
@@ -125,7 +133,8 @@ class Client:
         for thread in threads:
             thread.join()
 
-        self.thread_safe_print("All transfers complete, listening to offer requests")
+        self.thread_safe_print("All transfers complete, listening to offer requests", color=Colors.BLUE)
+
     def listen_for_offers(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as offer_sock:
             offer_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -134,34 +143,33 @@ class Client:
             # Bind to all interfaces
             offer_sock.bind(('0.0.0.0', self.bordacst))
 
-            self.thread_safe_print("Client is active, listening for server offers...")
+            self.thread_safe_print("Client is active, listening for server offers...", color=Colors.YELLOW)
 
             while True:
                 try:
                     packet, addr = offer_sock.recvfrom(RECEIVE_SIZE)
-                    # Add debug print
-                    self.thread_safe_print(f"Received packet of length {len(packet)} from {addr}")
+                    self.thread_safe_print(f"Received packet of length {len(packet)} from {addr}", color=Colors.YELLOW)
 
                     if len(packet) < 8:  # Minimum size for the expected packet
                         continue
 
                     magic_cookie, msg_type, udp_port, tcp_port = struct.unpack("!IBHH", packet)
                     self.thread_safe_print(f"Unpacked values: magic={hex(magic_cookie)}, type={msg_type}, "
-                                           f"UDP={udp_port}, TCP={tcp_port}")
+                                           f"UDP={udp_port}, TCP={tcp_port}", color=Colors.YELLOW)
 
                     if magic_cookie == MAGIC_COOKIE and msg_type == OFFER_TYPE:
                         self.serverIp = addr[0]
                         self.sudp_port = udp_port
                         self.stcp_port = tcp_port
-                        self.thread_safe_print(f"Received valid offer from {addr[0]}:{udp_port}")
+                        self.thread_safe_print(f"Received valid offer from {addr[0]}:{udp_port}", color=Colors.GREEN)
                         return
                     else:
-                        self.thread_safe_print(f"Invalid packet: wrong magic cookie or message type")
+                        self.thread_safe_print(f"Invalid packet: wrong magic cookie or message type", color=Colors.RED)
 
                 except struct.error as e:
-                    self.thread_safe_print(f"Error unpacking packet: {e}")
+                    self.thread_safe_print(f"Error unpacking packet: {e}", color=Colors.RED)
                 except Exception as e:
-                    self.thread_safe_print(f"Error receiving broadcast: {e}")
+                    self.thread_safe_print(f"Error receiving broadcast: {e}", color=Colors.RED)
                 time.sleep(0.1)
 
     def setup(self):
@@ -177,7 +185,7 @@ class Client:
                 raise ValueError("Number of UDP connections must be a positive integer.")
 
         except ValueError as e:
-            print(f"Invalid input: {e}. Please try again.")
+            self.thread_safe_print(f"Invalid input: {e}. Please try again.", color=Colors.RED)
             self.setup()
 
     def run(self):
@@ -192,13 +200,13 @@ if __name__ == "__main__":
     try:
         client.run()
     except KeyboardInterrupt:
-        print("\nKeyboardInterrupt detected. Exiting gracefully...\n")
+        print(f"{Colors.RED}\nKeyboardInterrupt detected. Exiting gracefully...{Colors.RESET}\n")
         sys.exit(0)
     except ValueError as ve:
-        print(f"\nError: {ve}. Exiting...\n")
+        print(f"{Colors.RED}\nError: {ve}. Exiting...{Colors.RESET}\n")
         sys.exit(1)
     except Exception as e:
-        print(f"\nAn unexpected error occurred: {e}. Exiting...\n")
+        print(f"{Colors.RED}\nAn unexpected error occurred: {e}. Exiting...{Colors.RESET}\n")
         sys.exit(1)
     finally:
-        print("Thank you for using the Client!")
+        print(f"{Colors.GREEN}Thank you for using the Client!{Colors.RESET}")
