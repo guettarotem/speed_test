@@ -1,67 +1,204 @@
 import socket
 import struct
+import sys
 import threading
 import time
 
-
-MAGIC_COOKIE = 0xabcddcba
-MSG_TYPE_OFFER = 0x2
-MSG_TYPE_REQUEST = 0x3
-MSG_TYPE_PAYLOAD = 0x4
+from network_config import *
+lock_print = threading.Lock()
 
 
 class Client:
+
     def __init__(self):
-        self.running = True
+        self.serverIp = None
+        self.sudp_port = None
+        self.stcp_port = None
+        self.tcp_connections = 0
+        self.udp_connections = 0
+        self.file_size = 0
+        self.is_active = True
+        self.bordacst = BROADCAST_PORT
 
-    def start(self):
-        while self.running:
-            print("Client started, listening for offer requests...")
-            self.listen_for_offers()
+    def thread_safe_print(self, message):
+        with lock_print:
+            print(message)
 
+    def transfer_udp(self, thread_id):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                packet = struct.pack('!IBQ', MAGIC_COOKIE, REQUEST_TYPE, self.file_size)
+                sock.sendto(packet, (self.serverIp, self.sudp_port))
+                sock.settimeout(1.0)
+
+                received_packets = 0
+                total_packets = 0
+                total_chunks = 1
+                current_chunk = 0
+                start_time = time.time()
+
+                try:
+                    while current_chunk < total_chunks:
+                        packet, _ = sock.recvfrom(4096)
+                        total_packets += 1
+                        cookie, msg_typ, total_chunks, rec_chunk = struct.unpack('!IBQQ', packet[:PAYLOAD_HEADER_SIZE])
+
+                        if cookie != MAGIC_COOKIE or msg_typ != PAYLOAD_TYPE:
+                            raise ValueError
+
+                        if rec_chunk == current_chunk + 1:
+                            current_chunk = rec_chunk
+                            received_packets += 1
+                except socket.timeout:
+                    pass
+
+                total_time = time.time() - start_time
+                speed = (received_packets * 8 * RECEIVE_SIZE) / total_time if total_time > 0 else 0
+                success_rate = (received_packets / total_packets * 100) if total_packets > 0 else 0
+
+                self.thread_safe_print(
+                    f"UDP transfer #{thread_id} finished, total time: {total_time:.2f} seconds, "
+                    f"total speed: {speed:.1f} bits/second, "
+                    f"percentage of packets received successfully: {success_rate:.1f}%"
+                )
+
+        except (ConnectionResetError, socket.error) as e:
+            self.thread_safe_print(f"Error during UDP test #{thread_id}: {e}")
+
+    def transfer_tcp(self, thread_id):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.connect((self.serverIp, self.stcp_port))
+
+                request_packet = struct.pack('!IBQ', MAGIC_COOKIE, REQUEST_TYPE, self.file_size)
+                sock.sendall(request_packet)
+
+                current_chunk = 0
+                total_chunks = 1
+                bytes_received = 0
+                start_time = time.time()
+
+                while current_chunk < total_chunks:
+                    data = sock.recv(self.file_size + PAYLOAD_HEADER_SIZE)
+                    if not data:
+                        break
+
+                    cookie, msg_type, total_chunks, chunk_num = struct.unpack('!IBQQ', data[:PAYLOAD_HEADER_SIZE])
+
+                    if cookie != MAGIC_COOKIE or msg_type != PAYLOAD_TYPE:
+                        raise ValueError("Invalid TCP payload received")
+
+                    if chunk_num != current_chunk + 1:
+                        raise ValueError(f"Expected chunk {current_chunk + 1}, but got {chunk_num}")
+
+                    current_chunk = chunk_num
+                    bytes_received += len(data[PAYLOAD_HEADER_SIZE:])
+
+                total_time = time.time() - start_time
+                speed = (bytes_received * 8) / total_time if total_time > 0 else 0
+
+                self.thread_safe_print(
+                    f"TCP transfer #{thread_id} finished, total time: {total_time:.2f} seconds, "
+                    f"total speed: {speed:.1f} bits/second"
+                )
+
+        except (ConnectionRefusedError, socket.error) as e:
+            self.thread_safe_print(f"TCP Connection {thread_id} failed: {str(e)}")
+
+    def handle_offer(self):
+        threads = []
+        print("Starting transfer tests...")
+
+        # Start UDP transfers
+        for i in range(1, self.udp_connections + 1):
+            thread = threading.Thread(target=self.transfer_udp, args=(i,))
+            threads.append(thread)
+            thread.start()
+
+        # Start TCP transfers
+        for i in range(1, self.tcp_connections + 1):
+            thread = threading.Thread(target=self.transfer_tcp, args=(i,))
+            threads.append(thread)
+            thread.start()
+
+        # Wait for all transfers to complete
+        for thread in threads:
+            thread.join()
+
+        self.thread_safe_print("All transfers complete, listening to offer requests")
     def listen_for_offers(self):
-        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        udp_socket.bind(('', 13117))
-        while self.running:
-            data, server_address = udp_socket.recvfrom(1024)
-            magic_cookie, msg_type, udp_port, tcp_port = struct.unpack('!IBHH', data[:9])
-            if magic_cookie == MAGIC_COOKIE and msg_type == MSG_TYPE_OFFER:
-                print(f"Received offer from {server_address[0]}:{udp_port}")
-                self.handle_offer(server_address[0], udp_port, tcp_port)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as offer_sock:
+            offer_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            offer_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-    def handle_offer(self, server_ip, udp_port, tcp_port):
-        file_size = int(input("Enter file size in bytes: "))
-        tcp_conn = threading.Thread(target=self.tcp_transfer, args=(server_ip, tcp_port, file_size))
-        tcp_conn.start()
-        udp_conn = threading.Thread(target=self.udp_transfer, args=(server_ip, udp_port, file_size))
-        udp_conn.start()
-        tcp_conn.join()
-        udp_conn.join()
+            # Bind to all interfaces
+            offer_sock.bind(('0.0.0.0', self.bordacst))
 
-    def tcp_transfer(self, server_ip, tcp_port, file_size):
-        start_time = time.time()
-        with socket.create_connection((server_ip, tcp_port)) as s:
-            s.sendall(f"{file_size}\n".encode())
-            data = s.recv(file_size)
-        end_time = time.time()
-        print(f"TCP transfer finished, total time: {end_time - start_time:.2f} seconds")
+            self.thread_safe_print("Client is active, listening for server offers...")
 
-    def udp_transfer(self, server_ip, udp_port, file_size):
-        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        request_packet = struct.pack('!IBQ', MAGIC_COOKIE, MSG_TYPE_REQUEST, file_size)
-        udp_socket.sendto(request_packet, (server_ip, udp_port))
+            while True:
+                try:
+                    packet, addr = offer_sock.recvfrom(RECEIVE_SIZE)
+                    # Add debug print
+                    self.thread_safe_print(f"Received packet of length {len(packet)} from {addr}")
 
-        start_time = time.time()
-        udp_socket.settimeout(1)
-        received_segments = 0
+                    if len(packet) < 8:  # Minimum size for the expected packet
+                        continue
 
-        while True:
-            try:
-                data, _ = udp_socket.recvfrom(1024)
-                received_segments += 1
-            except socket.timeout:
-                break
+                    magic_cookie, msg_type, udp_port, tcp_port = struct.unpack("!IBHH", packet)
+                    self.thread_safe_print(f"Unpacked values: magic={hex(magic_cookie)}, type={msg_type}, "
+                                           f"UDP={udp_port}, TCP={tcp_port}")
 
-        end_time = time.time()
-        print(f"UDP transfer finished, total time: {end_time - start_time:.2f} seconds, segments received: {received_segments}")
+                    if magic_cookie == MAGIC_COOKIE and msg_type == OFFER_TYPE:
+                        self.serverIp = addr[0]
+                        self.sudp_port = udp_port
+                        self.stcp_port = tcp_port
+                        self.thread_safe_print(f"Received valid offer from {addr[0]}:{udp_port}")
+                        return
+                    else:
+                        self.thread_safe_print(f"Invalid packet: wrong magic cookie or message type")
+
+                except struct.error as e:
+                    self.thread_safe_print(f"Error unpacking packet: {e}")
+                except Exception as e:
+                    self.thread_safe_print(f"Error receiving broadcast: {e}")
+                time.sleep(0.1)
+
+    def setup(self):
+        try:
+            self.file_size = int(input("Enter file size in bytes:"))
+            if self.file_size <= 0:
+                raise ValueError("File size must be a positive integer.")
+            self.tcp_connections = int(input("Enter the number of concurrent TCP connections: "))
+            if self.tcp_connections <= 0:
+                raise ValueError("Number of TCP connections must be a positive integer.")
+            self.udp_connections = int(input("Enter the number of concurrent UDP connections: "))
+            if self.udp_connections <= 0:
+                raise ValueError("Number of UDP connections must be a positive integer.")
+
+        except ValueError as e:
+            print(f"Invalid input: {e}. Please try again.")
+            self.setup()
+
+    def run(self):
+        self.setup()
+        while self.is_active:
+            self.listen_for_offers()
+            self.handle_offer()
+
+
+if __name__ == "__main__":
+    client = Client()
+    try:
+        client.run()
+    except KeyboardInterrupt:
+        print("\nKeyboardInterrupt detected. Exiting gracefully...\n")
+        sys.exit(0)
+    except ValueError as ve:
+        print(f"\nError: {ve}. Exiting...\n")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nAn unexpected error occurred: {e}. Exiting...\n")
+        sys.exit(1)
+    finally:
+        print("Thank you for using the Client!")
